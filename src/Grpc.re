@@ -8,6 +8,27 @@ let (<<) = (f, g, x) => f(g(x));
 type grpcClientRpcInvokeError;
 /* simply wraps grpcClientRpcInvokeError when an exception is needed */
 exception GrpcClientRpcInvokeError(grpcClientRpcInvokeError);
+/* protobufjs prefers the `long` package on npm for 64-bit type representation */
+module Long = {
+  type t;
+  [@bs.module "long"] external fromString: string => t;
+  [@bs.module "long"] external fromFloat: float => t = "fromNumber";
+  [@bs.module "long"] external fromInt: int => t = "fromNumber";
+  [@bs.module "long"] external fromValue: 'a => t;
+  [@bs.send] external toFloat: t => float = "toNumber";
+  [@bs.send] external toString: t => string = "toString";
+};
+
+[@bs.deriving abstract]
+type protobufjsToObjectOptions;
+let myProtobufjsToObjectOptions: protobufjsToObjectOptions = [%bs.raw
+  {|{
+      oneofs: true,
+      defaults: false,
+      keepCase: true,
+      enums: String,
+  }|}
+];
 
 /* "channel credentials" seem to be needed for creating a client */
 type channelCredentials;
@@ -16,7 +37,7 @@ type serverCredentials;
 
 /* protobufjs uses ByteBuffer abstraction over Node Buffer */
 type byteBuffer;
-[@bs.send] external bufferOfByteBuffer : byteBuffer => Node.buffer = "finish";
+[@bs.send] external bufferOfByteBuffer: byteBuffer => Node.buffer = "finish";
 
 /* flatMap an array of Futures */
 let futureFlatMapArray =
@@ -24,26 +45,28 @@ let futureFlatMapArray =
   Future.(
     make(resolve => {
       let result: array(option('b)) =
-        xs |. Array.length |. Belt.Array.make(None);
+        xs->Array.length->(Belt.Array.make(None));
       let xlen = Array.length(xs);
       let numJobs = ref(0);
       let cursor = ref(0);
       let rec pump = () => {
         if (cursor^ == xlen) {
           if (numJobs^ == 0) {
-            result |> Array.map(Belt.Option.getExn) |. resolve;
+            (result |> Array.map(Belt.Option.getExn))->resolve;
           };
         } else {
           let i = cursor^;
           cursor := cursor^ + 1;
           numJobs := numJobs^ + 1;
           xs[i]
-          |. f
-          |. get(x => {
-               result[i] = Some(x);
-               numJobs := numJobs^ - 1;
-               pump();
-             });
+          ->f
+          ->(
+              get(x => {
+                result[i] = Some(x);
+                numJobs := numJobs^ - 1;
+                pump();
+              })
+            );
         };
         ();
       };
@@ -58,8 +81,8 @@ let futureFlatMapArray =
    returns true, starting from element at index n, or None if no such element is
    found */
 let rec arrayFirst = (f, n, a) =>
-  n < Array.length(a) ?
-    f(a[n]) ? Some(a[n]) : arrayFirst(f, n + 1, a) : None;
+  n < Array.length(a)
+    ? f(a[n]) ? Some(a[n]) : arrayFirst(f, n + 1, a) : None;
 
 /* utility eunction; TODO is there a stdlib answer? */
 let optCall = (x, ~f) =>
@@ -90,6 +113,7 @@ module Validation = {
   exception NumberNotPositiveError;
   exception RegexMatchError;
   exception TransFieldError(string);
+  exception EmptyOneof(string);
 
   /* invokes user-supplied function to perform multi-field
    * validation, if such a function is supplied
@@ -118,16 +142,18 @@ module Validation = {
     Field(fieldName, Future.value(Belt.Result.Ok(x)));
   let fieldValidatorOfMessageValidator = (f, Field(name, future)) =>
     future
-    |. Future.flatMapOk(x =>
-         switch (x) {
-         | None => None |. Belt.Result.Ok |. Future.value
-         | Some(thing) =>
-           f(thing)
-           |. Future.mapError(str => str |. TransFieldError)
-           |. Future.mapOk(x => Some(x))
-         }
-       )
-    |. (fresult => Field(name, fresult));
+    ->(
+        Future.flatMapOk(x =>
+          switch (x) {
+          | None => None->Belt.Result.Ok->Future.value
+          | Some(thing) =>
+            f(thing)
+            ->(Future.mapError(str => str->TransFieldError))
+            ->(Future.mapOk(x => Some(x)))
+          }
+        )
+      )
+    ->(fresult => Field(name, fresult));
 
   let numberRange = (lo, hi) =>
     fieldMap @@
@@ -164,13 +190,13 @@ module Validation = {
     resultOptionFlatMap @@
     (x => s == x ? okSome(x) : error(WrongStringError));
   /* TODO is this in the stdlib? */
-  [@bs.new] external newRegExp : string => Js.Re.t = "RegExp";
+  [@bs.new] external newRegExp: string => Js.Re.t = "RegExp";
   let matchRegex = re => {
     let re = newRegExp(re);
     fieldMap @@
     futureMap @@
     resultOptionFlatMap @@
-    (x => x |. Js.Re.test(re) ? okSome(x) : error(RegexMatchError));
+    (x => x->(Js.Re.test(re)) ? okSome(x) : error(RegexMatchError));
   };
   let required = x =>
     x
@@ -184,12 +210,12 @@ module Validation = {
     fieldMap @@
     futureMap @@
     resultOptionFlatMap @@
-    (x => x |. String.length <= len ? okSome(x) : error(StringTooLongError));
+    (x => x->String.length <= len ? okSome(x) : error(StringTooLongError));
   let minStrLen = len =>
     fieldMap @@
     futureMap @@
     resultOptionFlatMap @@
-    (x => x |. String.length >= len ? okSome(x) : error(StringTooShortError));
+    (x => x->String.length >= len ? okSome(x) : error(StringTooShortError));
   let nonEmptyString = minStrLen(1);
   let trimString =
     fieldMap @@ futureMap @@ resultMap @@ optionMap @@ Js.String.trim;
@@ -203,30 +229,34 @@ module Validation = {
     (f, Field(fieldName, future)) => {
       let foo = x =>
         switch (x) {
-        | None => None |. Belt.Result.Ok |. Future.value
+        | None => None->Belt.Result.Ok->Future.value
         | Some(thing) =>
           let bar =
             thing
             |> futureFlatMapArray(
                  x =>
-                   Field(fieldName, Future.value(Belt.Result.Ok(Some(x))))
-                   |> f
-                   |> fieldGet
-                   |. Future.mapOk(Belt.Option.getExn),
+                   (
+                     Field(fieldName, Future.value(Belt.Result.Ok(Some(x))))
+                     |> f
+                     |> fieldGet
+                   )
+                   ->(Future.mapOk(Belt.Option.getExn)),
                  0x7fffffff,
                );
 
           bar
-          |. Future.map((x: array(Belt.Result.t('a, exn))) => {
-               let firstError = arrayFirst(Belt.Result.isError, 0, x);
-               switch (firstError) {
-               | Some(Belt.Result.Error(x)) => Belt.Result.Error(x)
-               | None => Belt.Result.Ok(Array.map(Belt.Result.getExn, x))
-               | Some(Belt.Result.Ok(_)) =>
-                 raise(ImpossibleError("found unfound element"))
-               };
-             })
-          |. Future.mapOk(x => Some(x));
+          ->(
+              Future.map((x: array(Belt.Result.t('a, exn))) => {
+                let firstError = arrayFirst(Belt.Result.isError, 0, x);
+                switch (firstError) {
+                | Some(Belt.Result.Error(x)) => Belt.Result.Error(x)
+                | None => Belt.Result.Ok(Array.map(Belt.Result.getExn, x))
+                | Some(Belt.Result.Ok(_)) =>
+                  raise(ImpossibleError("found unfound element"))
+                };
+              })
+            )
+          ->(Future.mapOk(x => Some(x)));
         };
       let future = Future.flatMapOk(future, foo);
       Field(fieldName, future);
@@ -238,8 +268,8 @@ module Validation = {
     futureMap(
       fun
       | Belt.Result.Ok(Some(x)) =>
-        x |. Array.length < len ?
-          Belt.Result.Error(ArrayTooShortError) : Belt.Result.Ok(Some(x))
+        x->Array.length < len
+          ? Belt.Result.Error(ArrayTooShortError) : Belt.Result.Ok(Some(x))
       | x => x,
     );
   let maxItemCount = (len, x: field(array('a))) =>
@@ -248,8 +278,8 @@ module Validation = {
     futureMap(
       fun
       | Belt.Result.Ok(Some(x)) =>
-        x |. Array.length > len ?
-          Belt.Result.Error(ArrayTooShortError) : Belt.Result.Ok(Some(x))
+        x->Array.length > len
+          ? Belt.Result.Error(ArrayTooShortError) : Belt.Result.Ok(Some(x))
       | x => x,
     );
 
@@ -286,7 +316,7 @@ type justNull = Js.Nullable.t(uninstantiable);
 type grpcLoadResult;
 
 [@bs.module "bs-grpc"]
-external grpcLoadProto : string => grpcLoadResult = "load";
+external grpcLoadProto: string => grpcLoadResult = "load";
 
 /* Represents a grpc.Server object */
 type server;
@@ -308,13 +338,21 @@ module ServerKeyAndCert = {
 };
 /* fileName = "undefined" */
 /* moduleName = "*root*" */
+module Tin = {
+  /* fileName = "tin.proto" */
+  /* moduleName = "Tin" */
+
+  type grpcProtoHandle;
+  [@bs.get] external getProtoHandle: grpcLoadResult => grpcProtoHandle = "tin";
+  let myProtoHandle = grpcLoadProto("tin.proto") |> getProtoHandle;
+};
 module Assemblyline = {
   /* fileName = "assemblyline.proto" */
   /* moduleName = "Assemblyline" */
 
   type grpcProtoHandle;
   [@bs.get]
-  external getProtoHandle : grpcLoadResult => grpcProtoHandle = "assemblyline";
+  external getProtoHandle: grpcLoadResult => grpcProtoHandle = "assemblyline";
   let myProtoHandle = grpcLoadProto("assemblyline.proto") |> getProtoHandle;
   module WidgetCondition = {
     /* fileName = "undefined" */
@@ -337,11 +375,35 @@ module Assemblyline = {
             {j|bs-grpc encountered invalid WidgetCondition enum value $x|j},
           ),
         );
+    /** convert a grpc symbolic enum string to its WidgetCondition.t counterpart; internal */
+    let widgetConditionOfString =
+      fun
+      | "WIDGET_CONDITION_ADEQUATE" => WidgetConditionAdequate
+      | "WIDGET_CONDITION_DEFECTIVE" => WidgetConditionDefective
+
+      | x =>
+        raise(
+          BsGrpcDecoderError(
+            {j|bs-grpc encountered invalid WidgetCondition enum value $x|j},
+          ),
+        );
     /** convert a WidgetCondition.t to its the grpc enum ordinal counterpart; internal */
     let intOfWidgetCondition =
       fun
       | WidgetConditionAdequate => 0
-      | WidgetConditionDefective => 1;
+      | WidgetConditionDefective => 1
+
+      | x =>
+        raise(
+          BsGrpcDecoderError(
+            {j|bs-grpc encountered invalid WidgetCondition enum value $x|j},
+          ),
+        );
+    /** convert a WidgetCondition.t to its the grpc symbolic enum string counterpart; internal */
+    let stringOfWidgetCondition =
+      fun
+      | WidgetConditionAdequate => "WIDGET_CONDITION_ADEQUATE"
+      | WidgetConditionDefective => "WIDGET_CONDITION_DEFECTIVE";
   };
   module BlankWidget = {
     /* fileName = "undefined" */
@@ -350,20 +412,20 @@ module Assemblyline = {
     [@bs.deriving abstract]
     type t = {
       [@bs.optional]
-      condition: int,
+      condition: string,
     };
     /** message constructor (shadows the deriving abstract constructor) */
     let t = (~condition=?, ()) =>
       t(
         ~condition=?
-          (Validation.optionMap @@ WidgetCondition.intOfWidgetCondition) @@
+          (Validation.optionMap @@ WidgetCondition.stringOfWidgetCondition) @@
           condition,
         (),
       );
     /* enum converting getter */
     let conditionGet =
       Validation.optionMap @@
-      WidgetCondition.widgetConditionOfInt
+      WidgetCondition.widgetConditionOfString
       << conditionGet;
     /* safe message constructor (may replace t()) */
     let make = (~condition=?, ()) => t(~condition?, ());
@@ -371,7 +433,7 @@ module Assemblyline = {
     /* sanitize, validate, normalize */
     let validate = x =>
       Future.make(resolve => {
-        let conditionRef = ref(x |. conditionGet);
+        let conditionRef = ref(x->conditionGet);
 
         let n = ref(1);
         let failed = ref(false);
@@ -398,44 +460,55 @@ module Assemblyline = {
             field := y;
             n := n^ - 1;
             if (n^ == 0) {
-              t(~condition=?conditionRef^, ())
-              |> (x => Some(x))
-              |> Validation.value("BlankWidget")
-              |> wholeMessageValidation
-              |> Validation.required
-              |. Validation.fold(
-                   opt => resolve(Belt.Result.Ok(Belt.Option.getExn(opt))),
-                   fail,
-                 );
+              (
+                t(~condition=?conditionRef^, ())
+                |> (x => Some(x))
+                |> Validation.value("BlankWidget")
+                |> wholeMessageValidation
+                |> Validation.required
+              )
+              ->(
+                  Validation.fold(
+                    opt => resolve(Belt.Result.Ok(Belt.Option.getExn(opt))),
+                    fail,
+                  )
+                );
             };
           };
         Validation.
           /* field validation */
           (
-            conditionRef^
-            |> value("condition")
-            |> required
-            |. fold(tick(conditionRef), fail)
-            |. ignore
+            (conditionRef^ |> value("condition") |> required)
+            ->(fold(tick(conditionRef), fail))
+            ->ignore
           );
       });
 
     type codec;
+    type intermediateMessageObject;
 
     [@bs.send]
-    external encode : (codec, t, justNull, justNull) => byteBuffer = "";
+    external encode:
+      (codec, intermediateMessageObject, justNull, justNull) => byteBuffer;
     [@bs.send]
-    external decode : (codec, Node.buffer, justNull, justNull) => t = "";
+    external decode:
+      (codec, Node.buffer, justNull, justNull) => intermediateMessageObject;
+    [@bs.send] external fromObject: (codec, t) => intermediateMessageObject;
+    [@bs.send]
+    external toObject:
+      (codec, intermediateMessageObject, protobufjsToObjectOptions) => t;
 
-    [@bs.get] external codec : grpcProtoHandle => codec = "BlankWidget";
+    [@bs.get] external codec: grpcProtoHandle => codec = "BlankWidget";
 
-    let codec = myProtoHandle |. codec;
+    let codec = myProtoHandle->codec;
 
     let encode = x =>
-      encode(codec, x, Js.Nullable.undefined, Js.Nullable.undefined)
-      |. bufferOfByteBuffer;
+      (x |> fromObject(codec))
+      ->encode(codec, _, Js.Nullable.undefined, Js.Nullable.undefined)
+      ->bufferOfByteBuffer;
     let decode = x =>
-      decode(codec, x, Js.Nullable.undefined, Js.Nullable.undefined);
+      decode(codec, x, Js.Nullable.undefined, Js.Nullable.undefined)
+      ->toObject(codec, _, myProtobufjsToObjectOptions);
   };
   module CutWidget = {
     /* fileName = "undefined" */
@@ -444,7 +517,7 @@ module Assemblyline = {
     [@bs.deriving abstract]
     type t = {
       [@bs.optional]
-      condition: int,
+      condition: string,
       [@bs.optional]
       numTeeth: int,
     };
@@ -452,7 +525,7 @@ module Assemblyline = {
     let t = (~condition=?, ~numTeeth=?, ()) =>
       t(
         ~condition=?
-          (Validation.optionMap @@ WidgetCondition.intOfWidgetCondition) @@
+          (Validation.optionMap @@ WidgetCondition.stringOfWidgetCondition) @@
           condition,
         ~numTeeth?,
         (),
@@ -460,7 +533,7 @@ module Assemblyline = {
     /* enum converting getter */
     let conditionGet =
       Validation.optionMap @@
-      WidgetCondition.widgetConditionOfInt
+      WidgetCondition.widgetConditionOfString
       << conditionGet;
     /* safe message constructor (may replace t()) */
     let make = (~condition=?, ~numTeeth=?, ()) =>
@@ -469,8 +542,8 @@ module Assemblyline = {
     /* sanitize, validate, normalize */
     let validate = x =>
       Future.make(resolve => {
-        let conditionRef = ref(x |. conditionGet);
-        let numTeethRef = ref(x |. numTeethGet);
+        let conditionRef = ref(x->conditionGet);
+        let numTeethRef = ref(x->numTeethGet);
 
         let n = ref(2);
         let failed = ref(false);
@@ -498,49 +571,59 @@ module Assemblyline = {
             field := y;
             n := n^ - 1;
             if (n^ == 0) {
-              t(~condition=?conditionRef^, ~numTeeth=?numTeethRef^, ())
-              |> (x => Some(x))
-              |> Validation.value("CutWidget")
-              |> wholeMessageValidation
-              |> Validation.required
-              |. Validation.fold(
-                   opt => resolve(Belt.Result.Ok(Belt.Option.getExn(opt))),
-                   fail,
-                 );
+              (
+                t(~condition=?conditionRef^, ~numTeeth=?numTeethRef^, ())
+                |> (x => Some(x))
+                |> Validation.value("CutWidget")
+                |> wholeMessageValidation
+                |> Validation.required
+              )
+              ->(
+                  Validation.fold(
+                    opt => resolve(Belt.Result.Ok(Belt.Option.getExn(opt))),
+                    fail,
+                  )
+                );
             };
           };
         open Validation;
         /* field validation */
-        conditionRef^
-        |> value("condition")
-        |> required
-        |. fold(tick(conditionRef), fail)
-        |. ignore;
+        (conditionRef^ |> value("condition") |> required)
+        ->(fold(tick(conditionRef), fail))
+        ->ignore;
         /* field validation */
-        numTeethRef^
-        |> value("numTeeth")
-        |> required
-        |> numberRange(32, 63)
-        |. fold(tick(numTeethRef), fail)
-        |. ignore;
+        (
+          numTeethRef^ |> value("numTeeth") |> required |> numberRange(32, 63)
+        )
+        ->(fold(tick(numTeethRef), fail))
+        ->ignore;
       });
 
     type codec;
+    type intermediateMessageObject;
 
     [@bs.send]
-    external encode : (codec, t, justNull, justNull) => byteBuffer = "";
+    external encode:
+      (codec, intermediateMessageObject, justNull, justNull) => byteBuffer;
     [@bs.send]
-    external decode : (codec, Node.buffer, justNull, justNull) => t = "";
+    external decode:
+      (codec, Node.buffer, justNull, justNull) => intermediateMessageObject;
+    [@bs.send] external fromObject: (codec, t) => intermediateMessageObject;
+    [@bs.send]
+    external toObject:
+      (codec, intermediateMessageObject, protobufjsToObjectOptions) => t;
 
-    [@bs.get] external codec : grpcProtoHandle => codec = "CutWidget";
+    [@bs.get] external codec: grpcProtoHandle => codec = "CutWidget";
 
-    let codec = myProtoHandle |. codec;
+    let codec = myProtoHandle->codec;
 
     let encode = x =>
-      encode(codec, x, Js.Nullable.undefined, Js.Nullable.undefined)
-      |. bufferOfByteBuffer;
+      (x |> fromObject(codec))
+      ->encode(codec, _, Js.Nullable.undefined, Js.Nullable.undefined)
+      ->bufferOfByteBuffer;
     let decode = x =>
-      decode(codec, x, Js.Nullable.undefined, Js.Nullable.undefined);
+      decode(codec, x, Js.Nullable.undefined, Js.Nullable.undefined)
+      ->toObject(codec, _, myProtobufjsToObjectOptions);
   };
   module WidgetColor = {
     /* fileName = "undefined" */
@@ -565,12 +648,38 @@ module Assemblyline = {
             {j|bs-grpc encountered invalid WidgetColor enum value $x|j},
           ),
         );
+    /** convert a grpc symbolic enum string to its WidgetColor.t counterpart; internal */
+    let widgetColorOfString =
+      fun
+      | "WIDGET_COLOR_UNPAINTED" => WidgetColorUnpainted
+      | "WIDGET_COLOR_RED" => WidgetColorRed
+      | "WIDGET_COLOR_GREEN" => WidgetColorGreen
+
+      | x =>
+        raise(
+          BsGrpcDecoderError(
+            {j|bs-grpc encountered invalid WidgetColor enum value $x|j},
+          ),
+        );
     /** convert a WidgetColor.t to its the grpc enum ordinal counterpart; internal */
     let intOfWidgetColor =
       fun
       | WidgetColorUnpainted => 0
       | WidgetColorRed => 1
-      | WidgetColorGreen => 2;
+      | WidgetColorGreen => 2
+
+      | x =>
+        raise(
+          BsGrpcDecoderError(
+            {j|bs-grpc encountered invalid WidgetColor enum value $x|j},
+          ),
+        );
+    /** convert a WidgetColor.t to its the grpc symbolic enum string counterpart; internal */
+    let stringOfWidgetColor =
+      fun
+      | WidgetColorUnpainted => "WIDGET_COLOR_UNPAINTED"
+      | WidgetColorRed => "WIDGET_COLOR_RED"
+      | WidgetColorGreen => "WIDGET_COLOR_GREEN";
   };
   module PaintedWidget = {
     /* fileName = "undefined" */
@@ -579,31 +688,31 @@ module Assemblyline = {
     [@bs.deriving abstract]
     type t = {
       [@bs.optional]
-      condition: int,
+      condition: string,
       [@bs.optional]
       numTeeth: int,
       [@bs.optional]
-      paintJob: int,
+      paintJob: string,
     };
     /** message constructor (shadows the deriving abstract constructor) */
     let t = (~condition=?, ~numTeeth=?, ~paintJob=?, ()) =>
       t(
         ~condition=?
-          (Validation.optionMap @@ WidgetCondition.intOfWidgetCondition) @@
+          (Validation.optionMap @@ WidgetCondition.stringOfWidgetCondition) @@
           condition,
         ~numTeeth?,
         ~paintJob=?
-          (Validation.optionMap @@ WidgetColor.intOfWidgetColor) @@ paintJob,
+          (Validation.optionMap @@ WidgetColor.stringOfWidgetColor) @@ paintJob,
         (),
       );
     /* enum converting getter */
     let conditionGet =
       Validation.optionMap @@
-      WidgetCondition.widgetConditionOfInt
+      WidgetCondition.widgetConditionOfString
       << conditionGet;
     /* enum converting getter */
     let paintJobGet =
-      Validation.optionMap @@ WidgetColor.widgetColorOfInt << paintJobGet;
+      Validation.optionMap @@ WidgetColor.widgetColorOfString << paintJobGet;
     /* safe message constructor (may replace t()) */
     let make = (~condition=?, ~numTeeth=?, ~paintJob=?, ()) =>
       t(~condition?, ~numTeeth?, ~paintJob?, ());
@@ -611,9 +720,9 @@ module Assemblyline = {
     /* sanitize, validate, normalize */
     let validate = x =>
       Future.make(resolve => {
-        let conditionRef = ref(x |. conditionGet);
-        let numTeethRef = ref(x |. numTeethGet);
-        let paintJobRef = ref(x |. paintJobGet);
+        let conditionRef = ref(x->conditionGet);
+        let numTeethRef = ref(x->numTeethGet);
+        let paintJobRef = ref(x->paintJobGet);
 
         let n = ref(3);
         let failed = ref(false);
@@ -642,60 +751,68 @@ module Assemblyline = {
             field := y;
             n := n^ - 1;
             if (n^ == 0) {
-              t(
-                ~condition=?conditionRef^,
-                ~numTeeth=?numTeethRef^,
-                ~paintJob=?paintJobRef^,
-                (),
+              (
+                t(
+                  ~condition=?conditionRef^,
+                  ~numTeeth=?numTeethRef^,
+                  ~paintJob=?paintJobRef^,
+                  (),
+                )
+                |> (x => Some(x))
+                |> Validation.value("PaintedWidget")
+                |> wholeMessageValidation
+                |> Validation.required
               )
-              |> (x => Some(x))
-              |> Validation.value("PaintedWidget")
-              |> wholeMessageValidation
-              |> Validation.required
-              |. Validation.fold(
-                   opt => resolve(Belt.Result.Ok(Belt.Option.getExn(opt))),
-                   fail,
-                 );
+              ->(
+                  Validation.fold(
+                    opt => resolve(Belt.Result.Ok(Belt.Option.getExn(opt))),
+                    fail,
+                  )
+                );
             };
           };
         open Validation;
         /* field validation */
-        conditionRef^
-        |> value("condition")
-        |> required
-        |. fold(tick(conditionRef), fail)
-        |. ignore;
+        (conditionRef^ |> value("condition") |> required)
+        ->(fold(tick(conditionRef), fail))
+        ->ignore;
         /* field validation */
-        numTeethRef^
-        |> value("numTeeth")
-        |> required
-        |> numberRange(32, 63)
-        |. fold(tick(numTeethRef), fail)
-        |. ignore;
+        (
+          numTeethRef^ |> value("numTeeth") |> required |> numberRange(32, 63)
+        )
+        ->(fold(tick(numTeethRef), fail))
+        ->ignore;
         /* field validation */
-        paintJobRef^
-        |> value("paintJob")
-        |> required
-        |. fold(tick(paintJobRef), fail)
-        |. ignore;
+        (paintJobRef^ |> value("paintJob") |> required)
+        ->(fold(tick(paintJobRef), fail))
+        ->ignore;
       });
 
     type codec;
+    type intermediateMessageObject;
 
     [@bs.send]
-    external encode : (codec, t, justNull, justNull) => byteBuffer = "";
+    external encode:
+      (codec, intermediateMessageObject, justNull, justNull) => byteBuffer;
     [@bs.send]
-    external decode : (codec, Node.buffer, justNull, justNull) => t = "";
+    external decode:
+      (codec, Node.buffer, justNull, justNull) => intermediateMessageObject;
+    [@bs.send] external fromObject: (codec, t) => intermediateMessageObject;
+    [@bs.send]
+    external toObject:
+      (codec, intermediateMessageObject, protobufjsToObjectOptions) => t;
 
-    [@bs.get] external codec : grpcProtoHandle => codec = "PaintedWidget";
+    [@bs.get] external codec: grpcProtoHandle => codec = "PaintedWidget";
 
-    let codec = myProtoHandle |. codec;
+    let codec = myProtoHandle->codec;
 
     let encode = x =>
-      encode(codec, x, Js.Nullable.undefined, Js.Nullable.undefined)
-      |. bufferOfByteBuffer;
+      (x |> fromObject(codec))
+      ->encode(codec, _, Js.Nullable.undefined, Js.Nullable.undefined)
+      ->bufferOfByteBuffer;
     let decode = x =>
-      decode(codec, x, Js.Nullable.undefined, Js.Nullable.undefined);
+      decode(codec, x, Js.Nullable.undefined, Js.Nullable.undefined)
+      ->toObject(codec, _, myProtobufjsToObjectOptions);
   };
   module BoxOfWidgets = {
     /* fileName = "undefined" */
@@ -712,7 +829,7 @@ module Assemblyline = {
     /* sanitize, validate, normalize */
     let validate = x =>
       Future.make(resolve => {
-        let paintedWidgetsRef = ref(x |. paintedWidgetsGet);
+        let paintedWidgetsRef = ref(x->paintedWidgetsGet);
 
         let n = ref(1);
         let failed = ref(false);
@@ -739,46 +856,61 @@ module Assemblyline = {
             field := y;
             n := n^ - 1;
             if (n^ == 0) {
-              t(~paintedWidgets=?paintedWidgetsRef^, ())
-              |> (x => Some(x))
-              |> Validation.value("BoxOfWidgets")
-              |> wholeMessageValidation
-              |> Validation.required
-              |. Validation.fold(
-                   opt => resolve(Belt.Result.Ok(Belt.Option.getExn(opt))),
-                   fail,
-                 );
+              (
+                t(~paintedWidgets=?paintedWidgetsRef^, ())
+                |> (x => Some(x))
+                |> Validation.value("BoxOfWidgets")
+                |> wholeMessageValidation
+                |> Validation.required
+              )
+              ->(
+                  Validation.fold(
+                    opt => resolve(Belt.Result.Ok(Belt.Option.getExn(opt))),
+                    fail,
+                  )
+                );
             };
           };
         Validation.
           /* message field validation */
           (
-            paintedWidgetsRef^
-            |> value("paintedWidgets")
-            |> repeated(
-                 fieldValidatorOfMessageValidator @@ PaintedWidget.validate,
-               )
-            |. fold(tick(paintedWidgetsRef), fail)
-            |. ignore
+            (
+              paintedWidgetsRef^
+              |> value("paintedWidgets")
+              |> repeated(
+                   fieldValidatorOfMessageValidator @@ PaintedWidget.validate,
+                 )
+            )
+            ->(fold(tick(paintedWidgetsRef), fail))
+            ->ignore
           );
       });
 
     type codec;
+    type intermediateMessageObject;
 
     [@bs.send]
-    external encode : (codec, t, justNull, justNull) => byteBuffer = "";
+    external encode:
+      (codec, intermediateMessageObject, justNull, justNull) => byteBuffer;
     [@bs.send]
-    external decode : (codec, Node.buffer, justNull, justNull) => t = "";
+    external decode:
+      (codec, Node.buffer, justNull, justNull) => intermediateMessageObject;
+    [@bs.send] external fromObject: (codec, t) => intermediateMessageObject;
+    [@bs.send]
+    external toObject:
+      (codec, intermediateMessageObject, protobufjsToObjectOptions) => t;
 
-    [@bs.get] external codec : grpcProtoHandle => codec = "BoxOfWidgets";
+    [@bs.get] external codec: grpcProtoHandle => codec = "BoxOfWidgets";
 
-    let codec = myProtoHandle |. codec;
+    let codec = myProtoHandle->codec;
 
     let encode = x =>
-      encode(codec, x, Js.Nullable.undefined, Js.Nullable.undefined)
-      |. bufferOfByteBuffer;
+      (x |> fromObject(codec))
+      ->encode(codec, _, Js.Nullable.undefined, Js.Nullable.undefined)
+      ->bufferOfByteBuffer;
     let decode = x =>
-      decode(codec, x, Js.Nullable.undefined, Js.Nullable.undefined);
+      decode(codec, x, Js.Nullable.undefined, Js.Nullable.undefined)
+      ->toObject(codec, _, myProtobufjsToObjectOptions);
   };
 };
 
@@ -789,7 +921,7 @@ module Server = {
      */
     module Ssl = {
       [@bs.module "bs-grpc"] [@bs.scope "ServerCredentials"]
-      external make :
+      external make:
         (buffer, array(ServerKeyAndCert.t), bool) => serverCredentials =
         "createSsl";
       let make = (~rootCert: buffer, ~privateKey: buffer, ~certChain: buffer) =>
@@ -801,17 +933,17 @@ module Server = {
     };
     module Insecure = {
       [@bs.module "bs-grpc"] [@bs.scope "ServerCredentials"]
-      external make : unit => serverCredentials = "createInsecure";
+      external make: unit => serverCredentials = "createInsecure";
     };
   };
 
   [@bs.module "bs-grpc"] [@bs.new]
-  external newServer : unit => server = "Server";
+  external newServer: unit => server = "Server";
 
   [@bs.send]
-  external serverBind : (server, string, serverCredentials) => unit = "bind";
+  external serverBind: (server, string, serverCredentials) => unit = "bind";
 
-  [@bs.send] external start : server => unit = "start";
+  [@bs.send] external start: server => unit = "start";
 
   /** Convenience function to instantiate and configure a GRPC server */
   let make = (~credentials, host) => {
@@ -826,8 +958,8 @@ module Server = {
 module Client = {
   module Metadata = {
     type t;
-    [@bs.module "bs-grpc"] [@bs.new] external make : unit => t = "Metadata";
-    [@bs.send] external set : (t, string, string) => unit = "";
+    [@bs.module "bs-grpc"] [@bs.new] external make: unit => t = "Metadata";
+    [@bs.send] external set: (t, string, string) => unit;
     let set = (t, key, value) => {
       set(t, key, value);
       t;
@@ -845,27 +977,26 @@ module Client = {
          the call object reflecting the request payload (not available in this
          binding) while the second argument is a function your metadata generator
          function must invoke with either an exception or the resulting metadata */
-      [@bs.module "bs-grpc"]
-      [@bs.scope "credentials"]
-      external make : generatorImplementation => callCredentials =
+      [@bs.module "bs-grpc"] [@bs.scope "credentials"]
+      external make: generatorImplementation => callCredentials =
         "createFromMetadataGenerator";
     };
   };
 
   module Credentials = {
     [@bs.module "bs-grpc"] [@bs.scope "credentials"]
-    external createInsecure : unit => channelCredentials = "";
+    external createInsecure: unit => channelCredentials;
 
     [@bs.module "bs-grpc"] [@bs.scope "credentials"]
-    external createSsl : (buffer, buffer, buffer) => channelCredentials = "";
+    external createSsl: (buffer, buffer, buffer) => channelCredentials;
 
     [@bs.module "bs-grpc"] [@bs.scope "credentials"]
-    external combine :
+    external combine:
       (channelCredentials, callCredentials) => channelCredentials =
       "combineChannelCredentials";
 
     [@bs.module "bs-grpc"] [@bs.scope "credentials"]
-    external combine3 :
+    external combine3:
       (channelCredentials, callCredentials, callCredentials) =>
       channelCredentials =
       "combineChannelCredentials";
@@ -876,4 +1007,4 @@ module Client = {
  * PEM format key/certificate
  */
 [@bs.val] [@bs.module "fs"]
-external loadCert : string => buffer = "readFileSync";
+external loadCert: string => buffer = "readFileSync";

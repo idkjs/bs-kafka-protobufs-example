@@ -75,3 +75,6 @@ Command failed: java.lang.IllegalArgumentException: Path must not end with / cha
 [offset]
 [zk: 10.101.0.1:20406(CONNECTED) 4] l
 ```
+
+
+## Stuck at kafka-topics not on path

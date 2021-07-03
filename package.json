@@ -11,19 +11,17 @@
     "start": "./bin/start",
     "stop": "./bin/stop"
   },
-  "keywords": [
-    "BuckleScript"
-  ],
+  "keywords": [ "BuckleScript" ],
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "bs-platform": "4.0.1"
+    "bs-platform": "9.0.2"
   },
   "dependencies": {
-    "bs-grpc": "^0.13.3",
-    "bs-kafka": "^0.1.0",
-    "grpc": "^1.13.0",
+    "bs-grpc": "^0.13.8-rc-se4",
+    "bs-kafka": "idkjs/bs-kafka",
+    "grpc": "^1.24.10",
     "kafka-node": "^2.6.1",
-    "reason-future": "^2.3.1"
+    "reason-future": "^2.6.0"
   }
 }
